@@ -9,3 +9,9 @@ siem-log-analysis/
 │   └── alerts.log
 ├── main.py
 └── README.md
+
+
+Jan 10 10:12:01 server sshd[1234]: Failed password for root from 192.168.1.10 port 22
+Jan 10 10:12:05 server sshd[1235]: Failed password for root from 192.168.1.10 port 22
+Jan 10 10:12:10 server sshd[1236]: Failed password for root from 192.168.1.10 port 22
+Jan 10 10:12:15 server sshd[1237]: Accepted password for root from 192.168.1.10 port 22
