@@ -1,0 +1,11 @@
+siem-log-analysis/
+├── logs/
+│   └── auth.log
+├── detections/
+│   └── brute_force.py
+├── parser/
+│   └── auth_parser.py
+├── output/
+│   └── alerts.log
+├── main.py
+└── README.md
