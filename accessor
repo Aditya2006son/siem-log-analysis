@@ -1,0 +1,198 @@
+import json
+import re
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+
+class SIEMLogAnalyzer:
+    """
+    Simple multi-log analyzer for searching related identity fields.
+
+    Supports:
+    - JSON / JSONL logs
+    - plain text logs with key=value style fields
+    - recursive folder scanning
+
+    Example use case:
+    Search by a person's name and collect related identifiers such as:
+    - login_id
+    - employee_id
+    - company_id
+    - username
+    - source_ip
+    """
+
+    def __init__(self, log_paths: List[str]) -> None:
+        self.log_paths = [Path(path) for path in log_paths]
+
+        # You can expand these aliases depending on your environment
+        self.field_aliases = {
+            "name": ["name", "full_name", "employee_name", "user_name", "display_name"],
+            "login_id": ["login_id", "login", "user_id", "userid", "account", "samaccountname"],
+            "company_id": ["company_id", "employee_id", "staff_id", "personnel_id", "id_number"],
+            "username": ["username", "user", "account_name"],
+            "email": ["email", "mail"],
+            "source_ip": ["source_ip", "src_ip", "ip", "client_ip"],
+            "device": ["device", "hostname", "host", "workstation"],
+            "timestamp": ["timestamp", "time", "event_time", "@timestamp", "date"],
+        }
+
+    def search_by_name(self, target_name: str) -> List[Dict[str, Any]]:
+        """
+        Search all configured logs for records related to a given name.
+        Matching is case-insensitive and partial by default.
+        """
+        normalized_target = self._normalize_value(target_name)
+        matches: List[Dict[str, Any]] = []
+
+        for file_path in self._iter_log_files():
+            for raw_record in self._read_records(file_path):
+                parsed_record = self._parse_record(raw_record)
+                if not parsed_record:
+                    continue
+
+                name_value = self._get_first_matching_field(parsed_record, "name")
+                if not name_value:
+                    continue
+
+                if normalized_target in self._normalize_value(str(name_value)):
+                    matches.append(
+                        {
+                            "source_file": str(file_path),
+                            "matched_name": name_value,
+                            "timestamp": self._get_first_matching_field(parsed_record, "timestamp"),
+                            "login_id": self._get_first_matching_field(parsed_record, "login_id"),
+                            "company_id": self._get_first_matching_field(parsed_record, "company_id"),
+                            "username": self._get_first_matching_field(parsed_record, "username"),
+                            "email": self._get_first_matching_field(parsed_record, "email"),
+                            "source_ip": self._get_first_matching_field(parsed_record, "source_ip"),
+                            "device": self._get_first_matching_field(parsed_record, "device"),
+                            "raw_record": parsed_record,
+                        }
+                    )
+
+        return matches
+
+    def summarize_identity(self, matches: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        """
+        Condense matched records into unique related values.
+        Useful when the same person appears in many logs.
+        """
+        summary = {
+            "matched_names": [],
+            "login_ids": [],
+            "company_ids": [],
+            "usernames": [],
+            "emails": [],
+            "source_ips": [],
+            "devices": [],
+            "timestamps": [],
+        }
+
+        for record in matches:
+            self._append_unique(summary["matched_names"], record.get("matched_name"))
+            self._append_unique(summary["login_ids"], record.get("login_id"))
+            self._append_unique(summary["company_ids"], record.get("company_id"))
+            self._append_unique(summary["usernames"], record.get("username"))
+            self._append_unique(summary["emails"], record.get("email"))
+            self._append_unique(summary["source_ips"], record.get("source_ip"))
+            self._append_unique(summary["devices"], record.get("device"))
+            self._append_unique(summary["timestamps"], record.get("timestamp"))
+
+        return summary
+
+    def _iter_log_files(self) -> Iterable[Path]:
+        for path in self.log_paths:
+            if path.is_file():
+                yield path
+            elif path.is_dir():
+                for file_path in path.rglob("*"):
+                    if file_path.is_file():
+                        yield file_path
+
+    def _read_records(self, file_path: Path) -> Iterable[str]:
+        try:
+            with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        yield line
+        except OSError:
+            # Skipping unreadable files is usually better than crashing the whole scan
+            return
+
+    def _parse_record(self, raw_record: str) -> Optional[Dict[str, Any]]:
+        # 1) Try JSON first
+        try:
+            parsed = json.loads(raw_record)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+        # 2) Fallback: parse key=value pairs from plain text logs
+        # Example:
+        # time=2026-03-20 user_name="John Smith" login_id=jsmith01 src_ip=10.1.2.3
+        kv_matches = re.findall(r'(\w+)=(".*?"|\S+)', raw_record)
+        if kv_matches:
+            parsed_record: Dict[str, Any] = {}
+            for key, value in kv_matches:
+                cleaned_value = value.strip('"')
+                parsed_record[key] = cleaned_value
+            return parsed_record
+
+        return None
+
+    def _get_first_matching_field(self, record: Dict[str, Any], logical_field: str) -> Optional[Any]:
+        aliases = self.field_aliases.get(logical_field, [])
+        for alias in aliases:
+            if alias in record and record[alias] not in (None, ""):
+                return record[alias]
+        return None
+
+    @staticmethod
+    def _normalize_value(value: str) -> str:
+        return re.sub(r"\s+", " ", value.strip().lower())
+
+    @staticmethod
+    def _append_unique(target_list: List[str], value: Any) -> None:
+        if value is None:
+            return
+        string_value = str(value)
+        if string_value and string_value not in target_list:
+            target_list.append(string_value)
+
+
+if __name__ == "__main__":
+    # Change these paths to your actual SIEM export folders or log files
+    analyzer = SIEMLogAnalyzer(
+        log_paths=[
+            "./logs",
+            "./auth_logs.jsonl",
+            "./vpn_logs.txt",
+        ]
+    )
+
+    person_name = "John Smith"
+
+    results = analyzer.search_by_name(person_name)
+    summary = analyzer.summarize_identity(results)
+
+    print(f"\nFound {len(results)} matching log record(s) for: {person_name}\n")
+
+    print("=== Identity Summary ===")
+    for key, values in summary.items():
+        print(f"{key}: {values}")
+
+    print("\n=== Detailed Matches ===")
+    for index, result in enumerate(results, start=1):
+        print(f"\nMatch #{index}")
+        print(f"Source File : {result['source_file']}")
+        print(f"Timestamp   : {result['timestamp']}")
+        print(f"Matched Name: {result['matched_name']}")
+        print(f"Login ID    : {result['login_id']}")
+        print(f"Company ID  : {result['company_id']}")
+        print(f"Username    : {result['username']}")
+        print(f"Email       : {result['email']}")
+        print(f"Source IP   : {result['source_ip']}")
+        print(f"Device      : {result['device']}")
