@@ -1,0 +1,247 @@
+import sqlite3
+from typing import Optional
+
+
+DB_PATH = "access_control.db"
+
+
+class AuthenticationPolicyManager:
+    def __init__(self, db_path: str = DB_PATH) -> None:
+        self.db_path = db_path
+        self._initialize_database()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db_path)
+
+    def _initialize_database(self) -> None:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    full_name TEXT NOT NULL,
+                    login_id TEXT UNIQUE NOT NULL,
+                    company_id TEXT UNIQUE,
+                    password TEXT NOT NULL,
+                    pin TEXT NOT NULL,
+                    is_blocked INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS auth_policy (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    password_login_enabled INTEGER NOT NULL DEFAULT 1,
+                    pin_login_enabled INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                INSERT OR IGNORE INTO auth_policy (id, password_login_enabled, pin_login_enabled)
+                VALUES (1, 1, 1)
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS access_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    login_id TEXT,
+                    full_name TEXT,
+                    event_type TEXT NOT NULL,
+                    event_message TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            conn.commit()
+
+    def add_user(
+        self,
+        full_name: str,
+        login_id: str,
+        company_id: Optional[str],
+        password: str,
+        pin: str,
+    ) -> None:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (full_name, login_id, company_id, password, pin)
+                VALUES (?, ?, ?, ?, ?)
+            """, (full_name, login_id, company_id, password, pin))
+            conn.commit()
+
+    def set_password_login_enabled(self, enabled: bool) -> None:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE auth_policy
+                SET password_login_enabled = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+            """, (1 if enabled else 0,))
+
+            cursor.execute("""
+                INSERT INTO access_audit (event_type, event_message)
+                VALUES (?, ?)
+            """, (
+                "AUTH_POLICY_CHANGE",
+                f"Password login {'enabled' if enabled else 'disabled'}"
+            ))
+            conn.commit()
+
+    def set_pin_login_enabled(self, enabled: bool) -> None:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE auth_policy
+                SET pin_login_enabled = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+            """, (1 if enabled else 0,))
+
+            cursor.execute("""
+                INSERT INTO access_audit (event_type, event_message)
+                VALUES (?, ?)
+            """, (
+                "AUTH_POLICY_CHANGE",
+                f"PIN login {'enabled' if enabled else 'disabled'}"
+            ))
+            conn.commit()
+
+    def require_pin_only_mode(self) -> None:
+        self.set_password_login_enabled(False)
+        self.set_pin_login_enabled(True)
+
+    def allow_normal_mode(self) -> None:
+        self.set_password_login_enabled(True)
+        self.set_pin_login_enabled(True)
+
+    def get_policy(self) -> dict:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT password_login_enabled, pin_login_enabled, updated_at
+                FROM auth_policy
+                WHERE id = 1
+            """)
+            row = cursor.fetchone()
+
+            return {
+                "password_login_enabled": bool(row[0]),
+                "pin_login_enabled": bool(row[1]),
+                "updated_at": row[2],
+            }
+
+    def authenticate_with_password(self, login_id: str, password: str) -> tuple[bool, str]:
+        policy = self.get_policy()
+        if not policy["password_login_enabled"]:
+            self._log_access_event(login_id, None, "LOGIN_DENIED", "Password authentication disabled by policy")
+            return False, "Unable to complete sign-in using this method at this time."
+
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT full_name, password, is_blocked
+                FROM users
+                WHERE login_id = ?
+            """, (login_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                self._log_access_event(login_id, None, "LOGIN_FAIL", "Unknown login ID")
+                return False, "Unable to complete sign-in. Please verify your credentials and try again."
+
+            full_name, stored_password, is_blocked = row
+
+            if is_blocked:
+                self._log_access_event(login_id, full_name, "LOGIN_DENIED", "User blocked")
+                return False, "Unable to complete sign-in at this time."
+
+            if password != stored_password:
+                self._log_access_event(login_id, full_name, "LOGIN_FAIL", "Invalid password")
+                return False, "Unable to complete sign-in. Please verify your credentials and try again."
+
+            self._log_access_event(login_id, full_name, "LOGIN_SUCCESS", "Password login success")
+            return True, "Access granted."
+
+    def authenticate_with_pin(self, login_id: str, pin: str) -> tuple[bool, str]:
+        policy = self.get_policy()
+        if not policy["pin_login_enabled"]:
+            self._log_access_event(login_id, None, "LOGIN_DENIED", "PIN authentication disabled by policy")
+            return False, "Unable to complete sign-in using this method at this time."
+
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT full_name, pin, is_blocked
+                FROM users
+                WHERE login_id = ?
+            """, (login_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                self._log_access_event(login_id, None, "LOGIN_FAIL", "Unknown login ID")
+                return False, "Unable to complete sign-in. Please verify your credentials and try again."
+
+            full_name, stored_pin, is_blocked = row
+
+            if is_blocked:
+                self._log_access_event(login_id, full_name, "LOGIN_DENIED", "User blocked")
+                return False, "Unable to complete sign-in at this time."
+
+            if pin != stored_pin:
+                self._log_access_event(login_id, full_name, "LOGIN_FAIL", "Invalid PIN")
+                return False, "Unable to complete sign-in. Please verify your credentials and try again."
+
+            self._log_access_event(login_id, full_name, "LOGIN_SUCCESS", "PIN login success")
+            return True, "Access granted."
+
+    def _log_access_event(
+        self,
+        login_id: Optional[str],
+        full_name: Optional[str],
+        event_type: str,
+        event_message: str,
+    ) -> None:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO access_audit (login_id, full_name, event_type, event_message)
+                VALUES (?, ?, ?, ?)
+            """, (login_id, full_name, event_type, event_message))
+            conn.commit()
+
+
+if __name__ == "__main__":
+    manager = AuthenticationPolicyManager()
+
+    # Demo seed data
+    try:
+        manager.add_user("John Smith", "jsmith01", "EMP-48291", "Password123", "4721")
+        manager.add_user("Alice Brown", "abrown02", "EMP-91822", "SecurePass", "9014")
+    except sqlite3.IntegrityError:
+        pass
+
+    print("=== Current Policy ===")
+    print(manager.get_policy())
+
+    print("\n=== Force PIN-only mode ===")
+    manager.require_pin_only_mode()
+    print(manager.get_policy())
+
+    print("\n=== Try password login (should fail generically) ===")
+    success, message = manager.authenticate_with_password("jsmith01", "Password123")
+    print("Success:", success)
+    print("Message:", message)
+
+    print("\n=== Try PIN login (should work) ===")
+    success, message = manager.authenticate_with_pin("jsmith01", "4721")
+    print("Success:", success)
+    print("Message:", message)
+
+    print("\n=== Restore normal mode ===")
+    manager.allow_normal_mode()
+    print(manager.get_policy())
